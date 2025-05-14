@@ -1,0 +1,72 @@
+import pandas as pd
+from sklearn.metrics import confusion_matrix, classification_report, accuracy_score
+
+def run_model_eval(file_path):
+    # load excel
+    df = pd.read_excel(file_path)
+    print(f"Found {len(df)} news items")
+    
+    # setup models to check
+    models = [
+        {
+            'name': 'BERTje', 
+            'col': 'bertje_score', 
+            'pos_thresh': 0.545, 
+            'neg_thresh': 0.45475
+        },
+        {
+            'name': 'RobBERT', 
+            'col': 'robbert_score', 
+            'pos_thresh': 0.5101, 
+            'neg_thresh': 0.425
+        },
+        {
+            'name': 'ChatGPT', 
+            'col': 'AI_Score', 
+            'pos_thresh': 0.785, 
+            'neg_thresh': 0.541
+        }
+    ]
+    
+    # truth values
+    y_true = df['Sentiment'].astype(int).values
+    labels = ["Negative", "Positive", "Neutral"]
+    
+    print("\nMODEL RESULTS")
+    print("-"*30)
+    
+    for m in models:
+        print(f"\n{m['name']}:")
+        
+        # classify based on thresholds
+        preds = []
+        for s in df[m['col']]:
+            if s > m['pos_thresh']: preds.append(1)  # pos
+            elif s < m['neg_thresh']: preds.append(0)  # neg
+            else: preds.append(2)  # neutral
+        
+        # make confusion matrix
+        cm = confusion_matrix(y_true, preds, labels=[0, 1, 2])
+        cm_df = pd.DataFrame(cm, index=labels, columns=labels)
+        print("\nConfusion Matrix:")
+        print(cm_df)
+        
+        # basic stats
+        acc = accuracy_score(y_true, preds)
+        print(f"\nAccuracy: {acc:.4f}")
+        
+        # detailed stats
+        print("\nDetailed metrics:")
+        print(classification_report(y_true, preds, target_names=labels, labels=[0, 1, 2]))
+
+# do the thing
+if __name__ == "__main__":
+    data_file = r"C:\Users\Gebruiker\Downloads\ScriptieDS\NewsWithSentiment.xlsx"
+    run_model_eval(data_file)nClassification Report:")
+        print(classification_report(y_true, predicted, target_names=label_names, labels=labels))
+
+if __name__ == "__main__":
+    RESULTS_FILE = r"C:\Users\Gebruiker\Downloads\ScriptieDS\NewsWithSentiment.xlsx"
+    evaluate_models(RESULTS_FILE)
+    
+#portfolio results
