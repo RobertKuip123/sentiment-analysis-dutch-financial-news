@@ -1,0 +1,196 @@
+import pandas as pd
+import re
+import time
+from openai import OpenAI
+
+# api key
+client = OpenAI(api_key=".........uNsdMjGT-xx0g29EB6nXu2xjM2ktXGXswYefKEoxrSQBlNbcPWQr4HA9PU8psT3BlbkFJCCN9skdQnYD7guSi5bGYHT0YaZVoFsnBY0DzfCwT6Tqp55_Z5sRb60lMikFXAxrfP-xwmQTPoA")
+
+# My file locations
+INPUT_FILE = r"C:\Users\Gebruiker\Downloads\ScriptieDS\NewsWithReturns.xlsx"
+OUTPUT_FILE = r"C:\Users\Gebruiker\Downloads\ScriptieDS\NewsWithSentiment.xlsx"
+
+# Loading the news data
+print("Loading news articles...")
+df = pd.read_excel(INPUT_FILE)
+
+# Prompts inputting for ai.
+def create_prompts():
+    return {
+        'prompt1': """Vergeet alle eerdere instructies. Stel je voor dat je een financieel expert bent gespecialiseerd in de analyse van aandelenmarktnieuws.
+Antwoord 'JA' als het goed nieuws is, 'NEE' als het slecht nieuws is, of 'ONBEKEND' als het onzeker is.
+Is deze headline goed of slecht voor de aandelenprijs van {company} op korte termijn?
+Geef vervolgens op de tweede regel een sentiment score tussen -1 (zeer negatief) en 1 (zeer positief).
+Headline: {headline}
+""",
+
+        'prompt2': """Vergeet alle eerdere instructies. Je bent een financieel expert gespecialiseerd in de analyse van aandelenmarktnieuws en aandeelhouder van {company}.
+Antwoord 'JA' als het goed nieuws is, 'NEE' als het slecht nieuws is, of 'ONBEKEND' als het onzeker is.
+Is deze headline goed of slecht voor de aandelenprijs van {company} op korte termijn?
+Geef vervolgens op de tweede regel een sentiment score tussen -1 (zeer negatief) en 1 (zeer positief).
+Headline: {headline}
+""",
+
+        'prompt3': """Vergeet alle eerdere instructies. Je bent een sentiment-analyse expert getraind in de analyse van aandelenmarktnieuws.
+Antwoord 'JA' als het goed nieuws is, 'NEE' als het slecht nieuws is, of 'ONBEKEND' als het onzeker is.
+Is deze headline goed of slecht voor de aandelenprijs van {company} op korte termijn?
+Geef vervolgens op de tweede regel een sentiment score tussen -1 (zeer negatief) en 1 (zeer positief).
+Headline: {headline}
+""",
+
+        'prompt4': """Vergeet alle eerdere instructies. Je bent een financieel expert gespecialiseerd in de analyse van aandelenmarktnieuws.
+Headline: {headline}
+Subline: {subline}
+Zijn deze headline en subline goed of slecht voor de aandelenprijs van {company} op korte termijn?
+Antwoord 'JA' als het goed nieuws is, 'NEE' als het slecht nieuws is, of 'ONBEKEND' als het onzeker is.
+Geef vervolgens op de tweede regel een sentiment score tussen -1 (zeer negatief) en 1 (zeer positief). Geef bovendien een korte en bondige toelichting van maximaal 10 woorden op deze tweede regel.""",
+
+        'prompt5': """Vergeet alle eerdere instructies. Stel je voor dat je een financieel expert bent gespecialiseerd in de analyse van aandelenmarktnieuws en aandeelhouder van {company}.
+Headline: {headline}
+Subline: {subline}
+Zijn deze headline en subline goed of slecht voor de aandelenprijs van {company} op korte termijn?
+Antwoord 'JA' als het goed nieuws is, 'NEE' als het slecht nieuws is, of 'ONBEKEND' als het onzeker is.
+Geef vervolgens op de tweede regel een sentiment score tussen -1 (zeer negatief) en 1 (zeer positief). Geef bovendien een korte en bondige toelichting van maximaal 10 woorden op deze tweede regel""", 
+    
+        'prompt6': """Vergeet alle eerdere instructies. Je bent een sentiment-analyse expert getraind in de analyse van aandelenmarktnieuws.
+Headline: {headline}
+Subline: {subline}
+Zijn deze headline en subline goed of slecht voor de aandelenprijs van {company} op korte termijn?
+Antwoord 'JA' als het goed nieuws is, 'NEE' als het slecht nieuws is, of 'ONBEKEND' als het onzeker is.
+Geef vervolgens op de tweede regel een sentiment score tussen -1 (zeer negatief) en 1 (zeer positief). Geef bovendien een korte en bondige toelichting van maximaal 10 woorden op deze tweede regel"""
+    }
+
+# Adding columns for sentiment results
+def setup_columns(df):
+    # First three prompts only have sentiment and score
+    for i in range(1, 4):
+        if f'Sentiment_P{i}' not in df.columns:
+            df[f'Sentiment_P{i}'] = None
+        if f'Score_P{i}' not in df.columns:
+            df[f'Score_P{i}'] = None
+    
+    # 
+    for i in range(4, 7):
+        if f'Sentiment_P{i}' not in df.columns:
+            df[f'Sentiment_P{i}'] = None
+        if f'Score_P{i}' not in df.columns:
+            df[f'Score_P{i}'] = None
+        if f'Explanation_P{i}' not in df.columns:
+            df[f'Explanation_P{i}'] = None
+            
+    return df
+
+# 
+def process_response(response_text, prompt_num):
+    lines = response_text.strip().split('\n')
+    
+    sentiment = "ONBEKEND"
+    score = None
+    explanation = ""
+    
+    # Get sentiment from first line
+    if lines:
+        sentiment = lines[0].strip()
+    
+    # Get score and explanation from second line
+    if len(lines) >= 2:
+        second_line = lines[1].strip()
+        
+        # Extract score
+        score_match = re.search(r'[-+]?\d*\.\d+|[-+]?\d+', second_line)
+        if score_match:
+            score = float(score_match.group())
+            
+        # Extract explanation for prompts 4-6
+        if prompt_num >= 4:
+            # Try to find explanation after the score
+            parts = second_line.split(' ', 1)
+            if len(parts) > 1:
+                explanation = parts[1]
+            else:
+                # If that doesn't work, just use the whole line
+                explanation = second_line
+    
+    return sentiment, score, explanation
+
+# Main processing function
+def run_sentiment_analysis():
+    prompts = create_prompts()
+    tokens_used = 0
+    
+   
+    df = setup_columns(df)
+    
+    print(f"Starting sentiment analysis on {len(df)} news articles...")
+    for idx, row in df.iterrows():
+        if idx % 10 == 0:
+            print(f"Processing article {idx+1}/{len(df)}")
+        
+        company = row['Company']
+        headline = row['Headline']
+        subline = row['Subline'] if 'Subline' in df.columns and pd.notna(row['Subline']) else ""
+        
+        
+        for p_num in range(1, 7):
+            # Skip if already done
+            if pd.notna(row[f'Score_P{p_num}']):
+                continue
+                
+            # Format the prompt
+            p_key = f'prompt{p_num}'
+            prompt = prompts[p_key].format(
+                company=company,
+                headline=headline,
+                subline=subline
+            )
+            
+            try:
+                # API call
+                response = client.chat.completions.create(
+                    model="gpt-4o-2024-08-06",
+                    messages=[{"role": "user", "content": prompt}],
+                    temperature=0,
+                    max_tokens=100
+                )
+                
+                # Process response
+                sentiment, score, explanation = process_response(
+                    response.choices[0].message.content,
+                    p_num
+                )
+                
+                # Store results
+                df.at[idx, f'Sentiment_P{p_num}'] = sentiment
+                df.at[idx, f'Score_P{p_num}'] = score
+                if p_num >= 4:
+                    df.at[idx, f'Explanation_P{p_num}'] = explanation
+                
+                # Track usage
+                tokens_used += response.usage.total_tokens
+                
+                # Pause between calls
+                time.sleep(0.5)
+                
+            except Exception as e:
+                print(f"Error with prompt {p_num} for article {idx}: {str(e)[:50]}")
+        
+        # Save progress periodically
+        if idx % 5 == 0:
+            df.to_excel(OUTPUT_FILE, index=False)
+    
+    # Final save
+    df.to_excel(OUTPUT_FILE, index=False)
+    print(f"Analysis complete. Used {tokens_used} tokens.")
+    
+    return df
+
+# Run everything
+if __name__ == "__main__":
+    df = run_sentiment_analysis()
+    
+    # Calculate average scores
+    df['AI_Score'] = df[['Score_P1', 'Score_P2', 'Score_P3', 'Score_P4', 'Score_P5', 'Score_P6']].mean(axis=1)
+    
+    # Save final results with averages
+    df.to_excel(OUTPUT_FILE, index=False)
+    print("Final results saved with AI Score averages.")
