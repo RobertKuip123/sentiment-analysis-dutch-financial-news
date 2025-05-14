@@ -1,0 +1,202 @@
+
+#IT is important to know that it is most handy to run this code in the google colab environment with at T2GPU as this covers 
+#the code way faster than on your own dekstop computer. Running the code there also does not cost any money.
+
+import pandas as pd, numpy as np, torch, os, re
+from sklearn.metrics import f1_score, precision_recall_fscore_support
+from transformers import AutoModelForMaskedLM, AutoTokenizer, DataCollatorForLanguageModeling, Trainer, TrainingArguments, AutoModelForSequenceClassification
+
+os.environ["WANDB_DISABLED"] = "true"; import warnings; warnings.filterwarnings("ignore")
+
+# File paths
+INPUT_FILE = r"C:\Users\Gebruiker\Downloads\ScriptieDS\NewsWithReturns.xlsx"
+OUTPUT_FILE = r"C:\Users\Gebruiker\Downloads\ScriptieDS\NewsWithSentiment.xlsx"
+TEMP_DIR = r"C:\Users\Gebruiker\Downloads\ScriptieDS\temp_models"
+os.makedirs(TEMP_DIR, exist_ok=True)
+
+def load_data(file_path):
+    print("Loading news data...")
+    df = pd.read_excel(file_path)
+    if 'Subline' in df.columns: df['combined_text'] = df['Headline'] + " " + df['Subline'].fillna("")
+    else: df['combined_text'] = df['Headline']
+    df = df.sort_values('Date')
+    print(f"Loaded {len(df)} articles, from {df['Date'].min()} to {df['Date'].max()}")
+    return df
+
+def domain_adapt_model(model_name, corpus_texts):
+    model_short_name = model_name.split('/')[-1]
+    print(f"\nDomain adaptation for {model_short_name}...")
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    model = AutoModelForMaskedLM.from_pretrained(model_name)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device)
+    
+    encodings = tokenizer(corpus_texts, truncation=True, padding=True, max_length=256, return_tensors="pt")
+    
+    class DomainCorpusDataset(torch.utils.data.Dataset):
+        def __init__(self, encodings): self.encodings = encodings
+        def __getitem__(self, idx): return {key: torch.tensor(val[idx]) for key, val in self.encodings.items()}
+        def __len__(self): return len(self.encodings.input_ids)
+    
+    dataset = DomainCorpusDataset(encodings)
+    data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=True, mlm_probability=0.15)
+    
+    output_dir = os.path.join(TEMP_DIR, f"{model_short_name}_adapted")
+    os.makedirs(output_dir, exist_ok=True)
+    
+    training_args = TrainingArguments(output_dir=output_dir, overwrite_output_dir=True, num_train_epochs=3,
+                                      per_device_train_batch_size=8, learning_rate=5e-5, save_steps=1000,
+                                      save_total_limit=1, logging_steps=200)
+    
+    trainer = Trainer(model=model, args=training_args, data_collator=data_collator, train_dataset=dataset)
+    
+    print(f"Starting domain adaptation training..."); trainer.train(); print("Domain adaptation completed")
+    return model, tokenizer
+
+def train_expanding_window(model, tokenizer, train_df, sentiment_column='Sentiment'):
+    print("\nStarting expanding window training...")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    sent_model = AutoModelForSequenceClassification.from_pretrained(model.config._name_or_path, num_labels=3)
+    sent_model.base_model.embeddings = model.base_model.embeddings
+    sent_model = sent_model.to(device)
+    
+    window_sizes = [0.4, 0.5, 0.6, 0.7, 0.8]
+    window_results = []; best_model = None; best_val_f1 = 0
+    
+    for i, window_size in enumerate(window_sizes):
+        window_num = i + 1
+        print(f"\nWindow {window_num}: {window_size*100:.0f}% training data")
+        
+        train_end = int(len(train_df) * window_size)
+        window_train_df = train_df.iloc[:train_end]
+        
+        val_start = train_end; val_end = min(val_start + int(len(train_df) * 0.1), len(train_df))
+        val_df = train_df.iloc[val_start:val_end]
+        
+        test_start = val_end; test_end = min(test_start + int(len(train_df) * 0.1), len(train_df))
+        test_df = train_df.iloc[test_start:test_end]
+        
+        print(f"  Training: {len(window_train_df)} articles, Validation: {len(val_df)}, Test: {len(test_df)}")
+        
+        
+        train_texts, train_labels = window_train_df['combined_text'].tolist(), window_train_df[sentiment_column].astype(int).tolist()
+        val_texts, val_labels = val_df['combined_text'].tolist(), val_df[sentiment_column].astype(int).tolist()
+        test_texts, test_labels = test_df['combined_text'].tolist(), test_df[sentiment_column].astype(int).tolist()
+        
+       
+        train_encodings = tokenizer(train_texts, truncation=True, padding=True, max_length=256, return_tensors="pt")
+        val_encodings = tokenizer(val_texts, truncation=True, padding=True, max_length=256, return_tensors="pt")
+        test_encodings = tokenizer(test_texts, truncation=True, padding=True, max_length=256, return_tensors="pt")
+        
+        train_dataset = torch.utils.data.TensorDataset(train_encodings['input_ids'], train_encodings['attention_mask'], torch.tensor(train_labels))
+        val_dataset = torch.utils.data.TensorDataset(val_encodings['input_ids'], val_encodings['attention_mask'], torch.tensor(val_labels))
+        test_dataset = torch.utils.data.TensorDataset(test_encodings['input_ids'], test_encodings['attention_mask'], torch.tensor(test_labels))
+        
+        train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=8, shuffle=True)
+        val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=16)
+        test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=16)
+        
+        
+        window_model = AutoModelForSequenceClassification.from_pretrained(model.config._name_or_path, num_labels=3)
+        window_model.base_model.embeddings = model.base_model.embeddings
+        window_model = window_model.to(device)
+        
+        optimizer = torch.optim.AdamW(window_model.parameters(), lr=5e-5, weight_decay=0.01)
+        loss_fn = torch.nn.CrossEntropyLoss()
+        
+        window_best_val_f1 = 0; window_best_epoch = 0
+        
+        for epoch in range(3):
+            # Training
+            window_model.train(); train_loss = 0
+            for batch in train_loader:
+                input_ids, attention_mask, labels = [b.to(device) for b in batch]
+                optimizer.zero_grad()
+                outputs = window_model(input_ids=input_ids, attention_mask=attention_mask)
+                loss = loss_fn(outputs.logits, labels)
+                loss.backward(); optimizer.step()
+                train_loss += loss.item()
+            
+            # Validation
+            window_model.eval(); val_preds = []; val_labels_list = []
+            with torch.no_grad():
+                for batch in val_loader:
+                    input_ids, attention_mask, labels = [b.to(device) for b in batch]
+                    outputs = window_model(input_ids=input_ids, attention_mask=attention_mask)
+                    probs = torch.softmax(outputs.logits, dim=1)
+                    preds = torch.argmax(probs, dim=1).cpu().numpy()
+                    val_preds.extend(preds); val_labels_list.extend(labels.cpu().numpy())
+            
+            val_f1 = f1_score(val_labels_list, val_preds, average='macro')
+            print(f"  Epoch {epoch+1}/3 - Loss: {train_loss/len(train_loader):.4f}, Val F1: {val_f1:.4f}")
+            
+            if val_f1 > window_best_val_f1:
+                window_best_val_f1 = val_f1; window_best_epoch = epoch
+                
+                # Test evaluation
+                test_preds = []; test_labels_list = []
+                with torch.no_grad():
+                    for batch in test_loader:
+                        input_ids, attention_mask, labels = [b.to(device) for b in batch]
+                        outputs = window_model(input_ids=input_ids, attention_mask=attention_mask)
+                        probs = torch.softmax(outputs.logits, dim=1); preds = torch.argmax(probs, dim=1).cpu().numpy()
+                        test_preds.extend(preds); test_labels_list.extend(labels.cpu().numpy())
+                
+                test_f1 = f1_score(test_labels_list, test_preds, average='macro')
+                print(f"  Test F1: {test_f1:.4f}")
+        
+        window_results.append({'window': window_num, 'size': window_size, 'val_f1': window_best_val_f1, 'best_epoch': window_best_epoch})
+        if window_best_val_f1 > best_val_f1: best_val_f1 = window_best_val_f1; best_model = window_model
+    
+    print("\nWindow results:")
+    for result in window_results: print(f"  Window {result['window']} ({result['size']*100:.0f}%): Val F1 = {result['val_f1']:.4f}")
+    print(f"Best validation F1: {best_val_f1:.4f}")
+    return best_model
+
+def generate_sentiment_scores(model, tokenizer, texts):
+    print("\nGenerating sentiment scores...")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = model.to(device); model.eval()
+    
+    batch_size = 16; all_scores = []
+    encodings = tokenizer(texts, truncation=True, padding=True, max_length=256, return_tensors="pt")
+    
+    for i in range(0, len(texts), batch_size):
+        batch_input_ids = encodings['input_ids'][i:i+batch_size].to(device)
+        batch_attention_mask = encodings['attention_mask'][i:i+batch_size].to(device)
+        
+        with torch.no_grad():
+            outputs = model(input_ids=batch_input_ids, attention_mask=batch_attention_mask)
+            probs = torch.softmax(outputs.logits, dim=1).cpu().numpy()
+            batch_scores = probs[:, 0] * 0 + probs[:, 1] * 1 + probs[:, 2] * 0.5  # Sentiment formula
+            all_scores.extend(batch_scores)
+    
+    return all_scores
+
+def main():
+    # 
+    df = load_data(INPUT_FILE)
+    domain_adaptation_size = int(len(df) * 0.4)  # First 40% for domain adaptation
+    domain_adaptation_df = df.iloc[:domain_adaptation_size]
+    domain_texts = domain_adaptation_df['combined_text'].tolist()
+    
+    # Processing the models
+    print("\n" + "="*50 + "\nPROCESSING BERTje MODEL\n" + "="*50)
+    bertje_adapted, bertje_tokenizer = domain_adapt_model("GroNLP/bert-base-dutch-cased", domain_texts)
+    bertje_model = train_expanding_window(bertje_adapted, bertje_tokenizer, df)
+    bertje_scores = generate_sentiment_scores(bertje_model, bertje_tokenizer, df['combined_text'].tolist())
+    df['bertje_score'] = bertje_scores
+    
+    print("\n" + "="*50 + "\nPROCESSING RobBERT MODEL\n" + "="*50)
+    robbert_adapted, robbert_tokenizer = domain_adapt_model("pdelobelle/robbert-v2-dutch-base", domain_texts)
+    robbert_model = train_expanding_window(robbert_adapted, robbert_tokenizer, df)
+    robbert_scores = generate_sentiment_scores(robbert_model, robbert_tokenizer, df['combined_text'].tolist())
+    df['robbert_score'] = robbert_scores
+    
+    # Saving the results
+    print("\nSaving results to Excel...")
+    df.to_excel(OUTPUT_FILE, index=False)
+    print(f"Results saved to {OUTPUT_FILE}")
+
+if __name__ == "__main__": main()
